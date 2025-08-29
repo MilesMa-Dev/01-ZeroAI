@@ -1,0 +1,189 @@
+# 🤖 Dynamic TinyGPT - 动态词汇表语言模型
+
+一个具有动态词汇表的最小化Transformer语言模型实现，支持从零开始学习任何语言的字符。
+
+## ✨ 核心特性
+
+- 🧠 **动态词汇表**: 从大小2开始，根据训练数据自动扩展词汇表
+- 📝 **字符级分词**: 自动学习中文、英文或任何Unicode字符
+- 💾 **永久记忆**: 无限容量的训练数据持久化存储
+- 📚 **文件批量训练**: 支持加载txt文件逐行训练
+- 🎯 **在线学习**: 每次输入都会触发模型训练
+- 🚀 **现代架构**: RoPE位置编码、权重共享、EMA、top-p采样
+
+## 🏗️ 架构概览
+
+### 核心组件
+```
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│ DynamicTokenizer │    │     TinyGPT      │    │ PersistentReplay│
+│                 │    │                  │    │                 │
+│ • 字符级分词     │───▶│ • 4层Transformer │───▶│ • 磁盘持久化     │
+│ • 动态扩展       │    │ • 8注意力头      │    │ • 内存缓存       │
+│ • JSON存储       │    │ • RoPE位置编码   │    │ • 混合采样       │
+└─────────────────┘    └──────────────────┘    └─────────────────┘
+```
+
+### 技术特性
+- **模型**: 256维嵌入, 4层, 8头注意力
+- **优化器**: AdamW + 余弦学习率调度
+- **采样**: 温度采样 + Top-K + Top-P (Nucleus)
+- **存储**: 500KB内存缓存 + 磁盘持久化
+
+## 🚀 快速开始
+
+### 安装依赖
+```bash
+pip install torch>=2.0.0
+```
+
+### 运行程序
+```bash
+python tiny_llm_demo.py
+```
+
+### 基本使用
+1. **文本输入**: 直接输入文本进行训练
+   ```
+   ✍️  Input: Hello World!
+   📝 Added 9 new characters to vocabulary (total: 11)
+   🔄 Expanded vocabulary from 2 to 11
+   ⚙️  Trained 20 steps | avg loss 2.543 | 2156 ms
+   ```
+
+2. **文件训练**: 批量处理txt文件
+   ```
+   /load_txt xiyou.txt
+   ```
+
+3. **生成文本**: 使用训练后的模型生成
+   ```
+   /gen Hello
+   ```
+
+## 📖 命令参考
+
+| 命令 | 功能 | 示例 |
+|------|------|------|
+| `文本输入` | 训练模型并扩展词汇表 | `你好世界` |
+| `/load_txt [file]` | 逐行加载训练文件 | `/load_txt data.txt` |
+| `/gen [prefix]` | 生成文本 | `/gen 西遊記` |
+| `/temp=X.X` | 设置采样温度 | `/temp=1.2` |
+| `/topp=X.X` | 设置top-p参数 | `/topp=0.9` |
+| `/steps=N` | 设置训练步数 | `/steps=50` |
+| `/stats` | 显示统计信息 | `/stats` |
+| `/save [file]` | 保存模型 | `/save my_model.pt` |
+| `/load [file]` | 加载模型 | `/load my_model.pt` |
+| `/quit` | 退出程序 | `/quit` |
+
+## 🎯 使用场景
+
+### 1. 语言学习实验
+```bash
+# 从空模型开始学习中文
+python tiny_llm_demo.py
+> 你好
+> 世界
+> /gen 你
+```
+
+### 2. 古文训练
+```bash
+# 训练古典文学
+> /load_txt xiyou.txt
+# 观察词汇表如何从英文扩展到中文
+> /stats
+```
+
+### 3. 多语言支持
+模型自动适应任何语言：
+- 🇨🇳 中文：自动学习汉字
+- 🇺🇸 英文：学习字母和标点
+- 🇯🇵 日文：支持假名和汉字
+- 🌍 任意Unicode字符
+
+## 📊 统计信息示例
+
+```
+📊 Enhanced TinyGPT Statistics:
+   Model parameters: 3.28M
+   Vocab size: 1162 (Dynamic)
+   RoPE: ✅  Weight sharing: ✅  EMA: ✅
+🔤 Vocabulary:
+   Characters: 1160  Special tokens: 2
+📚 Training Data:
+   Total data stored: 0.8 MB
+   Memory cache: 500.0 KB
+```
+
+## 🏆 技术亮点
+
+### 动态词汇表系统
+- **零开始**: 初始词汇表仅包含`<PAD>`和`<UNK>`
+- **自动扩展**: 遇到新字符时自动添加到词汇表
+- **模型同步**: 自动扩展嵌入层和输出层
+- **持久化**: 词汇表状态保存到JSON文件
+
+### 智能训练策略
+- **混合采样**: 20%最近数据 + 80%历史数据
+- **在线学习**: 每行输入独立训练
+- **无遗忘**: 所有历史数据永久保存
+
+### 鲁棒性设计
+- **错误恢复**: 生成失败时使用安全fallback
+- **内存管理**: 自动缓存大小控制
+- **状态恢复**: 支持中断后继续训练
+
+## 🔧 高级配置
+
+### 模型参数调整
+在代码中修改这些参数：
+```python
+n_embd = 256        # 嵌入维度
+n_head = 8          # 注意力头数
+n_layer = 4         # 层数
+block_size = 256    # 上下文长度
+```
+
+### 训练参数
+```python
+train_steps_per_pulse = 20  # 每次训练步数
+temperature = 1.1           # 生成温度
+top_p = 0.9                # nucleus采样参数
+```
+
+## 📁 文件结构
+
+```
+01-ZeroAI/
+├── tiny_llm_demo.py           # 主程序
+├── dynamic_vocab.json         # 动态词汇表
+├── model_checkpoint.pt        # 模型检查点
+├── training_data/
+│   └── training_data.bin      # 训练数据
+├── CLAUDE.md                  # 开发指导
+└── README.md                  # 项目文档
+```
+
+## 🤝 贡献
+
+欢迎提交Issue和Pull Request！
+
+### 开发环境
+1. 克隆仓库
+2. 安装依赖：`pip install torch`
+3. 运行测试：`python tiny_llm_demo.py`
+
+## 📄 许可证
+
+本项目采用MIT许可证。
+
+## 🙏 致谢
+
+- 基于Transformer架构
+- 灵感来源于GPT系列模型
+- 使用PyTorch深度学习框架
+
+---
+
+**🚀 开始你的AI语言模型之旅吧！从零开始，学习任何语言！**

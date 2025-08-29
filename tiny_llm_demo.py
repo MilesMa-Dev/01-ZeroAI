@@ -1,72 +1,255 @@
 # tiny_llm_demo.py
-# Minimal byte-level Transformer LM with online training "pulses".
-# Author: Miles + GPT-5 Thinking
+# Enhanced Transformer LM with SentencePiece, RoPE, weight sharing, cosine LR, EMA, and top-p sampling
+# Author: Miles + GPT-5 Thinking + Enhanced by Claude
 # Run: python tiny_llm_demo.py
 
 import math, sys, os, time, random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import json
+from typing import Optional, Tuple
 
 # ------------------------------
-# Config (updated for larger context)
+# Config (enhanced with modern features)
 # ------------------------------
-vocab_size   = 256           # byte-level
+initial_vocab_size = 0       # Dynamic vocabulary starts from 0
 block_size   = 256          # context length
-n_embd       = 256           # model width (increased for larger context)
-n_head       = 8             # more attention heads
-n_layer      = 4             # deeper model
-dropout      = 0.1           # small dropout for regularization
+n_embd       = 256           # model width
+n_head       = 8             # attention heads
+n_layer      = 4             # transformer layers
+dropout      = 0.1           # dropout rate
 device       = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# Enhanced features config
+use_rope     = True          # Rotary Position Embedding
+tie_weights  = True          # Weight tying between embedding and output
+use_ema      = True          # Exponential Moving Average
+ema_decay    = 0.999         # EMA decay rate
+top_p        = 0.9           # nucleus sampling
 
 seed = 1337
 torch.manual_seed(seed)
 random.seed(seed)
 
 # ------------------------------
-# Utilities: byte tokenizer
+# Dynamic Vocabulary Tokenizer
 # ------------------------------
-def encode_bytes(s: str) -> torch.Tensor:
-    # UTF-8 to bytes 0..255
-    b = s.encode('utf-8', errors='ignore')
-    return torch.tensor(list(b), dtype=torch.long)
+class DynamicTokenizer:
+    def __init__(self, vocab_file: str = "dynamic_vocab.json"):
+        self.vocab_file = vocab_file
+        self.char_to_id = {}  # Character to ID mapping
+        self.id_to_char = {}  # ID to character mapping
+        self.next_id = 0
+        
+        # Reserved tokens
+        self.pad_id = 0
+        self.unk_id = 1
+        
+        # Initialize with reserved tokens
+        self._add_token('<PAD>', self.pad_id)
+        self._add_token('<UNK>', self.unk_id)
+        self.next_id = 2
+        
+        # Load existing vocabulary if available
+        self._load_vocab()
+    
+    def _add_token(self, token: str, token_id: int = None):
+        """Add a token to the vocabulary"""
+        if token_id is None:
+            token_id = self.next_id
+            self.next_id += 1
+        
+        if token not in self.char_to_id:
+            self.char_to_id[token] = token_id
+            self.id_to_char[token_id] = token
+            
+            # Ensure next_id is always higher than existing IDs
+            if token_id >= self.next_id:
+                self.next_id = token_id + 1
+        
+        return token_id
+    
+    def _load_vocab(self):
+        """Load vocabulary from file if it exists"""
+        if os.path.exists(self.vocab_file):
+            try:
+                with open(self.vocab_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                self.char_to_id = data.get('char_to_id', {})
+                self.id_to_char = {int(k): v for k, v in data.get('id_to_char', {}).items()}
+                self.next_id = data.get('next_id', 2)
+                
+                print(f"📄 Loaded dynamic vocabulary from {self.vocab_file} (vocab_size: {len(self.char_to_id)})")
+            except Exception as e:
+                print(f"⚠️ Could not load vocabulary file: {e}. Starting with empty vocabulary.")
+        else:
+            print("🔧 Starting with empty dynamic vocabulary")
+    
+    def _save_vocab(self):
+        """Save vocabulary to file"""
+        try:
+            data = {
+                'char_to_id': self.char_to_id,
+                'id_to_char': {str(k): v for k, v in self.id_to_char.items()},
+                'next_id': self.next_id
+            }
+            
+            with open(self.vocab_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠️ Could not save vocabulary: {e}")
+    
+    def add_text(self, text: str):
+        """Add new characters from text to vocabulary"""
+        new_chars = []
+        for char in text:
+            if char not in self.char_to_id:
+                self._add_token(char)
+                new_chars.append(char)
+        
+        if new_chars:
+            print(f"📝 Added {len(new_chars)} new characters to vocabulary (total: {len(self.char_to_id)})")
+            self._save_vocab()
+    
+    
+    def encode(self, text: str) -> torch.Tensor:
+        """Encode text to token IDs"""
+        ids = []
+        for char in text:
+            if char in self.char_to_id:
+                ids.append(self.char_to_id[char])
+            else:
+                ids.append(self.unk_id)  # Unknown token
+        
+        return torch.tensor(ids, dtype=torch.long)
+    
+    def decode(self, ids: torch.Tensor) -> str:
+        """Decode token IDs to text, filtering out special tokens"""
+        if isinstance(ids, torch.Tensor):
+            ids = ids.tolist()
+        
+        chars = []
+        for token_id in ids:
+            if token_id in self.id_to_char:
+                char = self.id_to_char[token_id]
+                # Filter out special tokens (PAD, UNK)
+                if char not in ['<PAD>', '<UNK>']:
+                    chars.append(char)
+                # Skip special tokens silently
+            # If token_id not in vocabulary, skip it silently too
+        
+        return ''.join(chars)
+    
+    @property
+    def vocab_size(self) -> int:
+        """Current vocabulary size"""
+        return len(self.char_to_id)
+    
+    def get_stats(self):
+        """Get vocabulary statistics"""
+        return {
+            'vocab_size': self.vocab_size,
+            'total_characters': len([c for c in self.char_to_id.keys() if len(c) == 1 and c not in ['<PAD>', '<UNK>']]),
+            'special_tokens': len([c for c in self.char_to_id.keys() if c.startswith('<')]),
+            'vocab_file': self.vocab_file
+        }
 
-def decode_bytes(t: torch.Tensor) -> str:
-    by = bytes([int(x) for x in t.tolist()])
-    try:
-        return by.decode('utf-8', errors='ignore')
-    except:
-        return by.decode('latin1', errors='ignore')
+# Global tokenizer instance
+tokenizer = DynamicTokenizer()
 
 # ------------------------------
-# Model: tiny GPT-like Transformer
+# Rotary Position Embedding (RoPE)
+# ------------------------------
+class RoPEEmbedding(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int = 2048):
+        super().__init__()
+        self.dim = dim
+        
+        # Precompute frequencies
+        freqs = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        pos = torch.arange(max_seq_len).float()
+        freqs_grid = torch.outer(pos, freqs)  # (max_seq_len, dim//2)
+        
+        self.register_buffer('freqs_cos', torch.cos(freqs_grid))
+        self.register_buffer('freqs_sin', torch.sin(freqs_grid))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (batch, n_heads, seq_len, head_dim)
+        seq_len = x.size(2)
+        
+        # Get frequency components for current sequence length
+        cos = self.freqs_cos[:seq_len]  # (seq_len, dim//2)
+        sin = self.freqs_sin[:seq_len]  # (seq_len, dim//2)
+        
+        # Reshape cos/sin to match x dimensions: (1, 1, seq_len, dim//2)
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+        
+        # Split x into even and odd dimensions
+        x_even = x[..., ::2]   # (batch, n_heads, seq_len, head_dim//2)
+        x_odd = x[..., 1::2]   # (batch, n_heads, seq_len, head_dim//2)
+        
+        # Apply rotation
+        x_rotated_even = x_even * cos - x_odd * sin
+        x_rotated_odd = x_even * sin + x_odd * cos
+        
+        # Interleave back
+        x_rotated = torch.zeros_like(x)
+        x_rotated[..., ::2] = x_rotated_even
+        x_rotated[..., 1::2] = x_rotated_odd
+        
+        return x_rotated
+
+# ------------------------------
+# Model: Enhanced GPT-like Transformer
 # ------------------------------
 class CausalSelfAttention(nn.Module):
     def __init__(self, n_embd, n_head, block_size, dropout):
         super().__init__()
         assert n_embd % n_head == 0
         self.n_head = n_head
+        self.head_dim = n_embd // n_head
+        
         self.key    = nn.Linear(n_embd, n_embd, bias=False)
         self.query  = nn.Linear(n_embd, n_embd, bias=False)
         self.value  = nn.Linear(n_embd, n_embd, bias=False)
         self.proj   = nn.Linear(n_embd, n_embd, bias=False)
         self.attn_drop = nn.Dropout(dropout)
         self.resid_drop = nn.Dropout(dropout)
+        
+        # RoPE embedding
+        if use_rope:
+            self.rope = RoPEEmbedding(self.head_dim, block_size)
+        else:
+            self.rope = None
+            
         # causal mask
         mask = torch.tril(torch.ones(block_size, block_size)).view(1,1,block_size,block_size)
         self.register_buffer("mask", mask)
 
     def forward(self, x):
         B, T, C = x.size()
-        k = self.key(x).view(B, T, self.n_head, C//self.n_head).transpose(1,2)   # (B, nh, T, hs)
-        q = self.query(x).view(B, T, self.n_head, C//self.n_head).transpose(1,2) # (B, nh, T, hs)
-        v = self.value(x).view(B, T, self.n_head, C//self.n_head).transpose(1,2)
-
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(k.size(-1))  # (B, nh, T, T)
+        
+        # Compute queries, keys, values
+        q = self.query(x).view(B, T, self.n_head, self.head_dim).transpose(1,2)  # (B, nh, T, hs)
+        k = self.key(x).view(B, T, self.n_head, self.head_dim).transpose(1,2)    # (B, nh, T, hs)
+        v = self.value(x).view(B, T, self.n_head, self.head_dim).transpose(1,2)  # (B, nh, T, hs)
+        
+        # Apply RoPE if enabled
+        if self.rope is not None:
+            q = self.rope(q)
+            k = self.rope(k)
+        
+        # Scaled dot-product attention
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, nh, T, T)
         att = att.masked_fill(self.mask[:,:,:T,:T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_drop(att)
         y = att @ v  # (B, nh, T, hs)
+        
+        # Reshape and project
         y = y.transpose(1,2).contiguous().view(B, T, C)
         y = self.resid_drop(self.proj(y))
         return y
@@ -93,26 +276,84 @@ class TinyGPT(nn.Module):
     def __init__(self, vocab_size, block_size, n_layer, n_head, n_embd, dropout):
         super().__init__()
         self.block_size = block_size
-        self.tok_emb = nn.Embedding(vocab_size, n_embd)
-        self.pos_emb = nn.Embedding(block_size, n_embd)
+        self.initial_vocab_size = vocab_size
+        self.tok_emb = nn.Embedding(max(vocab_size, 10), n_embd)  # Start with at least 10 embeddings
+        
+        # Only use positional embedding if not using RoPE
+        if not use_rope:
+            self.pos_emb = nn.Embedding(block_size, n_embd)
+        else:
+            self.pos_emb = None
+            
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.Sequential(*[
             Block(n_embd, n_head, block_size, dropout) for _ in range(n_layer)
         ])
         self.ln_f = nn.LayerNorm(n_embd)
-        self.head = nn.Linear(n_embd, vocab_size, bias=False)
+        self.head = nn.Linear(n_embd, max(vocab_size, 10), bias=False)
+        
+        # Weight tying between embedding and output head
+        if tie_weights:
+            self.head.weight = self.tok_emb.weight
 
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Linear, nn.Embedding)):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
+    
+    def expand_vocab(self, new_vocab_size):
+        """Expand vocabulary size if needed"""
+        if new_vocab_size <= self.tok_emb.num_embeddings:
+            return  # No expansion needed
+        
+        old_emb_size = self.tok_emb.num_embeddings
+        old_head_size = self.head.out_features
+        
+        # Create new embedding layer with expanded vocabulary
+        new_tok_emb = nn.Embedding(new_vocab_size, self.tok_emb.embedding_dim).to(self.tok_emb.weight.device)
+        
+        # Copy old weights
+        with torch.no_grad():
+            new_tok_emb.weight[:old_emb_size] = self.tok_emb.weight
+            # Initialize new weights
+            nn.init.normal_(new_tok_emb.weight[old_emb_size:], mean=0.0, std=0.02)
+        
+        self.tok_emb = new_tok_emb
+        
+        # Update head layer if not using weight tying
+        if not tie_weights or self.head.weight.shape[0] != new_vocab_size:
+            new_head = nn.Linear(self.head.in_features, new_vocab_size, bias=False).to(self.head.weight.device)
+            
+            with torch.no_grad():
+                new_head.weight[:old_head_size] = self.head.weight
+                # Initialize new weights
+                nn.init.normal_(new_head.weight[old_head_size:], mean=0.0, std=0.02)
+            
+            self.head = new_head
+            
+            # Re-tie weights if needed
+            if tie_weights:
+                self.head.weight = self.tok_emb.weight
+        
+        print(f"🔄 Expanded vocabulary from {old_emb_size} to {new_vocab_size}")
+    
+    @property
+    def current_vocab_size(self):
+        """Get current vocabulary size"""
+        return self.tok_emb.num_embeddings
 
     def forward(self, idx, targets=None):
         B, T = idx.size()
         tok = self.tok_emb(idx)                         # (B,T,C)
-        pos = self.pos_emb(torch.arange(T, device=idx.device))  # (T,C)
-        x = self.drop(tok + pos)
+        
+        # Add positional encoding if not using RoPE
+        if self.pos_emb is not None:
+            pos = self.pos_emb(torch.arange(T, device=idx.device))  # (T,C)
+            x = self.drop(tok + pos)
+        else:
+            x = self.drop(tok)
+            
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.head(x)                           # (B,T,vocab)
@@ -122,17 +363,153 @@ class TinyGPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens=200, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens=200, temperature=1.0, top_k=None, top_p=None, adaptive_length=False):
         self.eval()
+        
+        # Ensure model vocabulary matches tokenizer
+        tokenizer_vocab_size = tokenizer.vocab_size
+        if self.current_vocab_size < tokenizer_vocab_size:
+            print(f"🔧 Expanding model vocab from {self.current_vocab_size} to {tokenizer_vocab_size}")
+            self.expand_vocab(tokenizer_vocab_size)
+        
+        # Adaptive length parameters
+        if adaptive_length:
+            min_length = max(10, max_new_tokens // 4)  # At least generate some content
+            stop_chars = {'。', '.', '!', '！', '?', '？', '\n'}  # Natural stopping points
+            repetition_window = 20  # Check for repetition in last N characters
+        
+        generated_length = 0
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.block_size:]
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] / max(1e-6, temperature)
+            # Check for adaptive stopping conditions
+            if adaptive_length and generated_length >= min_length:
+                # Convert current sequence to text for stopping condition checks
+                current_text = tokenizer.decode(idx[0])
+                
+                # Stop at natural sentence endings
+                if current_text and current_text[-1] in stop_chars:
+                    print(f"🛑 Natural stop at sentence ending (length: {generated_length})")
+                    break
+                
+                # Stop if we see repetitive patterns
+                if len(current_text) >= repetition_window * 2:
+                    recent = current_text[-repetition_window:]
+                    prev = current_text[-repetition_window*2:-repetition_window]
+                    if recent == prev:
+                        print(f"🛑 Repetition detected, stopping (length: {generated_length})")
+                        break
+            
+            generated_length += 1
+            if idx.size(1) == 0:
+                # For empty input, create a dummy input and use the first token prediction
+                dummy_input = torch.zeros((1, 1), dtype=torch.long, device=idx.device)
+                logits, _ = self(dummy_input)
+                # Apply temperature with safety limits
+                safe_temperature = max(0.1, min(temperature, 5.0))  # Limit temperature to [0.1, 5.0]
+                logits = logits[:, -1, :] / safe_temperature
+            else:
+                idx_cond = idx[:, -self.block_size:]
+                logits, _ = self(idx_cond)
+                # Apply temperature with safety limits
+                safe_temperature = max(0.1, min(temperature, 5.0))  # Limit temperature to [0.1, 5.0]
+                logits = logits[:, -1, :] / safe_temperature
+            
+            # Get current vocabulary size first
+            current_vocab_size = tokenizer.vocab_size
+            model_vocab_size = logits.size(-1)
+            
+            # Apply top-k filtering (ensure k doesn't exceed vocabulary size)
             if top_k is not None:
-                v, _ = torch.topk(logits, top_k)
-                logits[logits < v[:, [-1]]] = -float('inf')
+                effective_vocab_size = min(current_vocab_size, model_vocab_size)
+                effective_k = min(top_k, effective_vocab_size)
+                if effective_k > 0:
+                    v, _ = torch.topk(logits[..., :effective_vocab_size], effective_k)
+                    logits[logits < v[:, [-1]]] = -float('inf')
+            
+            # Apply top-p (nucleus) sampling
+            if top_p is not None and top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift the indices to the right to keep also the first token above the threshold
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                # Scatter sorted tensors to original indexing
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits[indices_to_remove] = -float('inf')
+                
             probs = F.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
+            
+            # Handle edge case where all probabilities might be invalid
+            if torch.isnan(probs).any() or torch.isinf(probs).any() or probs.sum() == 0:
+                # Fallback to uniform distribution over valid vocabulary
+                probs = torch.ones_like(logits)
+                probs = F.softmax(probs, dim=-1)
+                # Update model_vocab_size after fallback
+                model_vocab_size = probs.size(-1)
+            
+            # Ensure we don't sample beyond current vocabulary size
+            
+            if model_vocab_size > current_vocab_size:
+                # Truncate to actual vocabulary size
+                probs = probs[..., :current_vocab_size]
+                probs = probs / probs.sum(dim=-1, keepdim=True)  # Renormalize
+            elif model_vocab_size < current_vocab_size:
+                # Model hasn't been expanded yet, should not happen but handle it
+                print(f"⚠️  Model vocab size ({model_vocab_size}) < tokenizer vocab size ({current_vocab_size})")
+                current_vocab_size = model_vocab_size
+            
+            # Handle special tokens elimination based on vocabulary size
+            if current_vocab_size > 2:
+                probs[..., 0] = 0.0      # Completely eliminate PAD
+                probs[..., 1] = 0.0      # Completely eliminate UNK  
+                probs = probs / probs.sum(dim=-1, keepdim=True)  # Renormalize
+                
+                # Safety check: if all probabilities are zero, use uniform over non-special tokens
+                if torch.any(torch.isnan(probs)) or torch.any(probs.sum(dim=-1) == 0):
+                    probs = torch.zeros_like(probs)
+                    probs[..., 2:current_vocab_size] = 1.0 / max(1, current_vocab_size - 2)
+            elif current_vocab_size == 2:
+                # Special case: only PAD and UNK available, use UNK but warn
+                probs[..., 0] = 0.0  # Eliminate PAD
+                probs[..., 1] = 1.0  # Use UNK as fallback
+                print("⚠️  Very small vocabulary, using UNK token")
+            else:
+                # Emergency fallback for vocab size 1
+                probs[..., 0] = 1.0
+                print("⚠️  Extremely small vocabulary, using PAD token")
+            
+            try:
+                next_id = torch.multinomial(probs, num_samples=1)
+            except RuntimeError as e:
+                if "selected index k out of range" in str(e):
+                    # Emergency fallback: choose a random valid token (avoid special tokens)
+                    valid_range = min(current_vocab_size, probs.size(-1))
+                    if valid_range > 2:  # Have at least PAD, UNK, and one more token
+                        # Choose from non-special tokens (start from index 2)
+                        next_id = torch.randint(2, valid_range, (probs.size(0), 1))
+                    elif valid_range > 1:
+                        # Use any available non-PAD token (even UNK is better than PAD)
+                        next_id = torch.tensor([[1]], dtype=torch.long, device=probs.device)
+                    else:
+                        # Absolute fallback
+                        next_id = torch.tensor([[1]], dtype=torch.long, device=probs.device)
+                    print(f"🔧 Used fallback sampling: token {next_id.item()}")
+                else:
+                    raise e
+            
+            # Ensure generated token is within vocabulary bounds
+            if next_id.item() >= current_vocab_size:
+                # Choose a random valid non-special token instead of UNK
+                if current_vocab_size > 2:
+                    safe_id = torch.randint(2, current_vocab_size, (1,)).item()
+                    next_id = torch.tensor([[safe_id]], dtype=torch.long, device=next_id.device)
+                    print(f"🔧 Token out of bounds, using random valid token: {safe_id}")
+                else:
+                    next_id = torch.tensor([[tokenizer.unk_id]], dtype=torch.long, device=next_id.device)
+                    print(f"🔧 Token out of bounds, using UNK token")
             idx = torch.cat([idx, next_id], dim=1)
         return idx
 
@@ -197,8 +574,14 @@ class PersistentReplayText:
     def sample_batch(self, batch_size=16, block_size=256, device='cpu'):
         """Sample training batches from disk and memory cache"""
         if self.total_size < block_size + 1:
-            # Bootstrap with random bytes for initial training
-            data = torch.randint(0, 256, (block_size+1,), dtype=torch.long)
+            # Bootstrap with random tokens for initial training
+            vocab_size = max(tokenizer.vocab_size, 2)  # Ensure at least 2 tokens (PAD, UNK)
+            if vocab_size <= 2:
+                # Use simple pattern for very small vocab
+                data = torch.tensor([tokenizer.unk_id] * (block_size + 1), dtype=torch.long)
+            else:
+                data = torch.randint(0, vocab_size, (block_size+1,), dtype=torch.long)
+            
             ix = torch.randint(0, 1, (batch_size,))
             x = torch.stack([data[:block_size] for _ in range(batch_size)])
             y = torch.stack([data[1:block_size+1] for _ in range(batch_size)])
@@ -210,13 +593,28 @@ class PersistentReplayText:
         
         for _ in range(batch_size):
             # 20% chance to sample from cache (recent data), 80% from full history
-            if random.random() < 0.2 and len(self.memory_cache) > block_size + 1:
-                # Sample from memory cache (recent data)
-                data = torch.tensor(list(self.memory_cache), dtype=torch.long)
-                max_start = data.numel() - block_size - 1
-                start_idx = torch.randint(0, max(1, max_start), (1,)).item()
-                x = data[start_idx:start_idx + block_size]
-                y = data[start_idx + 1:start_idx + block_size + 1]
+            if random.random() < 0.2 and len(self.memory_cache) > 100:
+                # Sample from memory cache (recent data) - tokenize on the fly
+                try:
+                    text = self.memory_cache.decode('utf-8', errors='ignore')
+                    lines = text.strip().split('\n')
+                    if lines:
+                        line = random.choice(lines)
+                        tokens = tokenizer.encode(line)
+                        if len(tokens) > block_size:
+                            start_idx = random.randint(0, len(tokens) - block_size - 1)
+                            x = tokens[start_idx:start_idx + block_size]
+                            y = tokens[start_idx + 1:start_idx + block_size + 1]
+                        else:
+                            # Pad if too short
+                            pad_len = block_size + 1 - len(tokens)
+                            padded = torch.cat([tokens, torch.zeros(pad_len, dtype=torch.long)])
+                            x = padded[:block_size]
+                            y = padded[1:block_size + 1]
+                    else:
+                        x, y = self._sample_from_disk(block_size)
+                except:
+                    x, y = self._sample_from_disk(block_size)
             else:
                 # Sample from disk (full history)
                 x, y = self._sample_from_disk(block_size)
@@ -230,27 +628,64 @@ class PersistentReplayText:
     
     def _sample_from_disk(self, block_size):
         """Sample a single sequence from disk storage"""
-        if self.total_size < block_size + 1:
-            # Fallback to random data
-            data = torch.randint(0, 256, (block_size + 1,), dtype=torch.long)
+        if self.total_size < 100:
+            # Fallback to random tokens (avoid special tokens)
+            vocab_size = max(tokenizer.vocab_size, 2)
+            if vocab_size <= 2:
+                # With very small vocab, create a simple pattern using available tokens
+                data = torch.tensor([1] * (block_size + 1), dtype=torch.long)  # Use UNK as last resort
+            else:
+                # Generate random tokens from non-special token range (start from index 2)
+                data = torch.randint(2, vocab_size, (block_size + 1,), dtype=torch.long)
             return data[:block_size], data[1:block_size + 1]
         
-        # Choose random position in file
-        max_start = self.total_size - block_size - 1
-        start_pos = random.randint(0, max_start)
-        
-        # Read data from file
-        with open(self.data_file, 'rb') as f:
-            f.seek(start_pos)
-            data_bytes = f.read(block_size + 1)
-        
-        # Convert to tensor
-        if len(data_bytes) < block_size + 1:
-            # Handle edge case - pad with random bytes
-            data_bytes += bytes([random.randint(0, 255) for _ in range(block_size + 1 - len(data_bytes))])
-        
-        data = torch.tensor(list(data_bytes), dtype=torch.long)
-        return data[:block_size], data[1:block_size + 1]
+        try:
+            # Read a random chunk from the file and tokenize
+            chunk_size = min(2000, self.total_size)  # Read up to 2KB
+            start_pos = random.randint(0, max(0, self.total_size - chunk_size))
+            
+            with open(self.data_file, 'rb') as f:
+                f.seek(start_pos)
+                data_bytes = f.read(chunk_size)
+            
+            # Decode and get random line
+            text = data_bytes.decode('utf-8', errors='ignore')
+            lines = [line.strip() for line in text.split('\n') if line.strip()]
+            
+            if not lines:
+                # Fallback (avoid special tokens)
+                vocab_size = max(tokenizer.vocab_size, 2)
+                if vocab_size <= 2:
+                    data = torch.tensor([1] * (block_size + 1), dtype=torch.long)  # UNK as last resort
+                else:
+                    data = torch.randint(2, vocab_size, (block_size + 1,), dtype=torch.long)  # Non-special tokens only
+                return data[:block_size], data[1:block_size + 1]
+            
+            # Choose random line and tokenize
+            line = random.choice(lines)
+            tokens = tokenizer.encode(line)
+            
+            if len(tokens) > block_size:
+                start_idx = random.randint(0, len(tokens) - block_size - 1)
+                x = tokens[start_idx:start_idx + block_size]
+                y = tokens[start_idx + 1:start_idx + block_size + 1]
+            else:
+                # Pad if too short
+                pad_len = block_size + 1 - len(tokens)
+                padded = torch.cat([tokens, torch.zeros(pad_len, dtype=torch.long)])
+                x = padded[:block_size]
+                y = padded[1:block_size + 1]
+            
+            return x, y
+            
+        except Exception:
+            # Fallback to random tokens
+            vocab_size = max(tokenizer.vocab_size, 2)
+            if vocab_size <= 2:
+                data = torch.tensor([tokenizer.unk_id] * (block_size + 1), dtype=torch.long)
+            else:
+                data = torch.randint(0, vocab_size, (block_size + 1,), dtype=torch.long)
+            return data[:block_size], data[1:block_size + 1]
     
     def get_stats(self):
         """Get storage statistics"""
@@ -261,6 +696,100 @@ class PersistentReplayText:
         }
 
 # ------------------------------
+# EMA (Exponential Moving Average) for model weights
+# ------------------------------
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {}
+        self.original = {}
+        
+        # Initialize shadow weights
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+    
+    def update(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                if name in self.shadow:
+                    # Check if parameter size has changed (vocabulary expansion)
+                    if param.data.shape != self.shadow[name].shape:
+                        # Expand shadow weights for vocabulary expansion
+                        old_size = self.shadow[name].shape[0]
+                        new_size = param.data.shape[0]
+                        
+                        if len(param.data.shape) == 2 and new_size > old_size:  # Embedding or Linear layer
+                            # Create new shadow tensor with expanded size
+                            new_shadow = torch.zeros_like(param.data)
+                            new_shadow[:old_size] = self.shadow[name]
+                            new_shadow[old_size:] = param.data[old_size:].clone()  # Initialize new weights
+                            self.shadow[name] = new_shadow
+                        else:
+                            # For other shape mismatches, reinitialize
+                            self.shadow[name] = param.data.clone()
+                    
+                    self.shadow[name] = self.decay * self.shadow[name] + (1 - self.decay) * param.data
+                else:
+                    # New parameter, initialize shadow
+                    self.shadow[name] = param.data.clone()
+    
+    def apply_shadow(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.original[name] = param.data.clone()
+                
+                # Handle size mismatch (vocabulary expansion)
+                if param.data.shape != self.shadow[name].shape:
+                    # Update shadow to match current parameter size
+                    self.update(model)
+                
+                if param.data.shape == self.shadow[name].shape:
+                    param.data = self.shadow[name]
+                else:
+                    # Skip if still mismatched
+                    print(f"⚠️  Skipping EMA shadow for {name} due to size mismatch")
+    
+    def restore(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.original:
+                # Handle size mismatch
+                if param.data.shape == self.original[name].shape:
+                    param.data = self.original[name]
+                else:
+                    print(f"⚠️  Cannot restore {name} due to size mismatch")
+        self.original.clear()
+
+# ------------------------------
+# Cosine Learning Rate Scheduler
+# ------------------------------
+class CosineScheduler:
+    def __init__(self, optimizer, warmup_steps=100, max_steps=10000, min_lr=1e-5):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.max_steps = max_steps
+        self.min_lr = min_lr
+        self.base_lr = optimizer.param_groups[0]['lr']
+        self.step_count = 0
+    
+    def step(self):
+        self.step_count += 1
+        
+        if self.step_count <= self.warmup_steps:
+            # Linear warmup
+            lr = self.base_lr * (self.step_count / self.warmup_steps)
+        else:
+            # Cosine annealing
+            progress = (self.step_count - self.warmup_steps) / (self.max_steps - self.warmup_steps)
+            progress = min(progress, 1.0)
+            lr = self.min_lr + (self.base_lr - self.min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+        
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+        
+        return lr
+
+# ------------------------------
 # Checkpoint save/load functions
 # ------------------------------
 def save_checkpoint(model, optimizer, replay, filename="model_checkpoint.pt"):
@@ -268,7 +797,7 @@ def save_checkpoint(model, optimizer, replay, filename="model_checkpoint.pt"):
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'config': {
-            'vocab_size': vocab_size,
+            'vocab_size': tokenizer.vocab_size,
             'block_size': block_size,
             'n_layer': n_layer,
             'n_head': n_head,
@@ -300,6 +829,12 @@ def load_checkpoint(model, optimizer, replay, filename="model_checkpoint.pt"):
                 print(f"   Current:    block_size={block_size}, n_embd={n_embd}, n_head={n_head}, n_layer={n_layer}")
                 print("   Cannot load incompatible checkpoint.")
                 return False
+            
+            # Handle dynamic vocabulary size - expand model if needed
+            checkpoint_vocab_size = config.get('vocab_size', 0)
+            if checkpoint_vocab_size > model.current_vocab_size:
+                print(f"🔄 Expanding model vocabulary from {model.current_vocab_size} to {checkpoint_vocab_size}")
+                model.expand_vocab(checkpoint_vocab_size)
         
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -317,9 +852,19 @@ def load_checkpoint(model, optimizer, replay, filename="model_checkpoint.pt"):
 # ------------------------------
 # Setup
 # ------------------------------
-model = TinyGPT(vocab_size, block_size, n_layer, n_head, n_embd, dropout).to(device)
+# Initialize with dynamic vocabulary (starting from 2 for PAD and UNK tokens)
+initial_vocab_size = max(tokenizer.vocab_size, 2)
+model = TinyGPT(initial_vocab_size, block_size, n_layer, n_head, n_embd, dropout).to(device)
 opt = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.01)
 replay = PersistentReplayText()  # Unlimited persistent storage
+
+# Enhanced training components
+if use_ema:
+    ema = EMA(model, decay=ema_decay)
+else:
+    ema = None
+
+scheduler = CosineScheduler(opt, warmup_steps=100, max_steps=10000)
 
 # Try to load existing checkpoint
 if load_checkpoint(model, opt, replay):
@@ -338,34 +883,89 @@ batch_size = 4
 
 def training_pulse(steps=50):
     model.train()
-    avg = 0.0
+    avg_loss = 0.0
     for i in range(steps):
         x, y = replay.sample_batch(batch_size=batch_size, block_size=block_size, device=device)
         logits, loss = model(x, y)
+        
         opt.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        avg += loss.item()
-    return avg / max(1, steps)
+        
+        # Update learning rate schedule
+        lr = scheduler.step()
+        
+        # Update EMA
+        if ema is not None:
+            ema.update(model)
+            
+        avg_loss += loss.item()
+    
+    return avg_loss / max(1, steps)
 
-def generate_sample(prefix:str="", max_new_tokens=200):
-    with torch.no_grad():
-        if prefix:
-            start = encode_bytes(prefix).unsqueeze(0).to(device)
-        else:
-            # start with a single space byte
-            start = torch.tensor([[32]], dtype=torch.long, device=device)
-        out = model.generate(start, max_new_tokens=max_new_tokens, temperature=temperature, top_k=100)
-        gen = out[0].tolist()
-        if prefix:
-            gen = gen[len(start[0]):]  # drop the prefix bytes
-        return decode_bytes(torch.tensor(gen))
+def process_text_line(text: str, show_generation=True):
+    """Process a single line of text just like normal user input"""
+    # First, add new characters to tokenizer vocabulary
+    tokenizer.add_text(text)
+    
+    # Expand model vocabulary if needed
+    if tokenizer.vocab_size > model.current_vocab_size:
+        model.expand_vocab(tokenizer.vocab_size)
+    
+    # Add to training data
+    replay.add(text)
+    
+    # Train on this text
+    t0 = time.time()
+    avg_loss = training_pulse(train_steps_per_pulse)
+    dt = (time.time()-t0)*1000
+    print(f"⚙️  Trained {train_steps_per_pulse} steps | avg loss {avg_loss:.3f} | {dt:.0f} ms")
+
+    # Generate sample if requested
+    if show_generation:
+        try:
+            print("\n🧪 Sampling after update...")
+            sample = generate_sample(prefix="", max_new_tokens=100, adaptive_length=True)
+            print(f"\n--- Generation (temp={temperature}) ---\n{sample}\n--- end ---")
+        except Exception as e:
+            print(f"⚠️  Generation failed: {e}")
+            print("   Training completed successfully, but generation had issues.")
+
+def generate_sample(prefix: str = "", max_new_tokens=200, adaptive_length=True):
+    # Use EMA weights for generation if available
+    if ema is not None:
+        ema.apply_shadow(model)
+    
+    try:
+        with torch.no_grad():
+            if prefix:
+                start = tokenizer.encode(prefix).unsqueeze(0).to(device)
+            else:
+                # Start with empty context - no initial token, let model generate from scratch
+                start = torch.empty((1, 0), dtype=torch.long, device=device)
+            
+            # Use dynamic top-k based on vocabulary size
+            effective_k = min(100, max(10, tokenizer.vocab_size // 2))
+            out = model.generate(start, max_new_tokens=max_new_tokens, 
+                               temperature=temperature, top_k=effective_k, top_p=top_p,
+                               adaptive_length=adaptive_length)
+            gen = out[0].tolist()
+            
+            if prefix:
+                gen = gen[len(start[0]):]  # drop the prefix tokens
+            # For empty start, all generated tokens are new
+            
+            return tokenizer.decode(torch.tensor(gen))
+    finally:
+        # Restore original weights
+        if ema is not None:
+            ema.restore(model)
 
 # ------------------------------
 # REPL
 # ------------------------------
-help_tip = "Enter text to learn from, or commands: /gen [prefix], /temp=1.2, /steps=200, /train [txt_file], /save [filename], /load [filename], /stats, /quit"
+help_tip = "Enhanced TinyGPT with Dynamic Vocabulary, RoPE, weight sharing, cosine LR, EMA, and top-p sampling\nCommands: /gen [prefix], /temp=1.2, /topp=0.9, /steps=200, /load_txt [txt_file], /train [txt_file], /save [filename], /load [filename], /stats, /reset, /quit"
 print(help_tip)
 
 while True:
@@ -378,6 +978,27 @@ while True:
         break
 
     if not user:
+        continue
+
+    if user.startswith("/reset"):
+        # Reset model to initial state
+        if input("⚠️  This will delete all training data and reset the model. Continue? (y/n): ").lower().strip() == 'y':
+            try:
+                # Remove model files
+                if os.path.exists("dynamic_vocab.json"):
+                    os.remove("dynamic_vocab.json")
+                if os.path.exists("model_checkpoint.pt"):
+                    os.remove("model_checkpoint.pt")
+                if os.path.exists("training_data"):
+                    import shutil
+                    shutil.rmtree("training_data")
+                
+                print("🔄 Model reset complete. Please restart the program for changes to take effect.")
+                break
+            except Exception as e:
+                print(f"❌ Reset failed: {e}")
+        else:
+            print("Reset cancelled.")
         continue
 
     if user.startswith("/quit"):
@@ -394,6 +1015,14 @@ while True:
             print("Usage: /temp=1.2")
         continue
 
+    if user.startswith("/topp="):
+        try:
+            top_p = float(user.split("=",1)[1])
+            print(f"Set top_p = {top_p}")
+        except:
+            print("Usage: /topp=0.9")
+        continue
+
     if user.startswith("/steps="):
         try:
             train_steps_per_pulse = int(user.split("=",1)[1])
@@ -406,7 +1035,10 @@ while True:
         # /gen optional_prefix
         prefix = user[4:].lstrip()
         print("\n🧪 Sampling...")
-        txt = generate_sample(prefix=prefix, max_new_tokens=500)
+        # Use adaptive length for better natural responses
+        adaptive = len(prefix.strip()) > 0  # Use adaptive for prefixed generation
+        max_tokens = 300 if adaptive else 500  # Shorter max when adaptive
+        txt = generate_sample(prefix=prefix, max_new_tokens=max_tokens, adaptive_length=adaptive)
         print(f"\n--- Generation (temp={temperature}) ---\n{txt}\n--- end ---")
         continue
 
@@ -417,19 +1049,11 @@ while True:
         save_checkpoint(model, opt, replay, filename)
         continue
 
-    if user.startswith("/load"):
-        # /load optional_filename
-        parts = user.split(None, 1)
-        filename = parts[1] if len(parts) > 1 else "model_checkpoint.pt"
-        load_checkpoint(model, opt, replay, filename)
-        continue
-
-
-    if user.startswith("/train"):
-        # /train filename.txt
+    if user.startswith("/load_txt"):
+        # /load_txt filename.txt
         parts = user.split(None, 1)
         if len(parts) < 2:
-            print("Usage: /train filename.txt")
+            print("Usage: /load_txt filename.txt")
             continue
         
         filename = parts[1]
@@ -438,7 +1062,7 @@ while True:
             continue
         
         try:
-            print(f"📖 Reading file: {filename}")
+            print(f"📖 Loading and processing file: {filename}")
             with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
             
@@ -447,28 +1071,71 @@ while True:
                 print("❌ File is empty")
                 continue
             
-            print(f"📚 Found {total_lines} lines, training line by line...")
+            print(f"📚 Found {total_lines} lines, processing line by line...\n")
             
             for i, line in enumerate(lines, 1):
                 line = line.strip()
                 if not line:  # Skip empty lines
+                    print(f"⏭️  Skipping empty line {i}/{total_lines}")
+                    continue
+                
+                print(f"\n📝 Processing line {i}/{total_lines}: {line}")
+                
+                # Process this line like normal user input
+                process_text_line(line, show_generation=True)
+                
+                # Add a small delay to make output readable
+                import time
+                time.sleep(0.1)
+            
+            print(f"\n✅ Finished processing {filename}")
+            
+        except Exception as e:
+            print(f"❌ Error reading file {filename}: {e}")
+        continue
+
+    if user.startswith("/load"):
+        # /load optional_filename (for model checkpoints)
+        parts = user.split(None, 1)
+        filename = parts[1] if len(parts) > 1 else "model_checkpoint.pt"
+        load_checkpoint(model, opt, replay, filename)
+        continue
+
+
+    if user.startswith("/train"):
+        # /train filename.txt - Legacy command, now same as /load_txt
+        parts = user.split(None, 1)
+        if len(parts) < 2:
+            print("Usage: /train filename.txt (note: consider using /load_txt instead)")
+            continue
+        
+        filename = parts[1]
+        if not os.path.exists(filename):
+            print(f"❌ File not found: {filename}")
+            continue
+        
+        try:
+            print(f"📖 Training on file: {filename}")
+            with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+            
+            total_lines = len(lines)
+            if total_lines == 0:
+                print("❌ File is empty")
+                continue
+            
+            print(f"📚 Found {total_lines} lines, training line by line...\n")
+            
+            for i, line in enumerate(lines, 1):
+                line = line.strip()
+                if not line:  # Skip empty lines
+                    print(f"⏭️  Skipping empty line {i}/{total_lines}")
                     continue
                 
                 print(f"\n📝 Training on line {i}/{total_lines}: {line}")
                 
-                # Add line to training data
-                replay.add(line)
-                
-                # Train on this line
-                t0 = time.time()
-                avg_loss = training_pulse(train_steps_per_pulse)
-                dt = (time.time()-t0)*1000
-                print(f"⚙️  Trained {train_steps_per_pulse} steps | avg loss {avg_loss:.3f} | {dt:.0f} ms")
-                
-                # Generate sample after each line training (like manual input)
-                print("🧪 Sampling after update...")
-                sample = generate_sample(prefix="", max_new_tokens=300)
-                print(f"\n--- Generation (temp={temperature}) ---\n{sample}\n--- end ---")
+                # Process this line like normal user input
+                process_text_line(line, show_generation=True)
             
             print(f"\n✅ Finished training on {filename}")
             
@@ -478,21 +1145,28 @@ while True:
 
     if user.startswith("/stats"):
         stats = replay.get_stats()
-        print(f"📊 Training Data Statistics:")
+        print(f"📊 Enhanced TinyGPT Statistics:")
+        print(f"   Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+        print(f"   Vocab size: {tokenizer.vocab_size} (Dynamic)")
+        print(f"   RoPE: {'✅' if use_rope else '❌'}")
+        print(f"   Weight sharing: {'✅' if tie_weights else '❌'}")
+        print(f"   EMA: {'✅' if use_ema else '❌'}")
+        print(f"   Current LR: {scheduler.optimizer.param_groups[0]['lr']:.2e}")
+        print(f"   Training steps: {scheduler.step_count}")
+        print(f"   Temperature: {temperature}")
+        print(f"   Top-p: {top_p}")
+        # Add vocabulary statistics
+        vocab_stats = tokenizer.get_stats()
+        print(f"🔤 Vocabulary:")
+        print(f"   Characters: {vocab_stats['total_characters']}")
+        print(f"   Special tokens: {vocab_stats['special_tokens']}")
+        print(f"   Vocab file: {vocab_stats['vocab_file']}")
+        print(f"📚 Training Data:")
         print(f"   Total data stored: {stats['total_size_mb']:.1f} MB")
         print(f"   Memory cache: {stats['cache_size_kb']:.1f} KB")
         print(f"   Data file: {stats['data_file']}")
-        print(f"   Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
         continue
 
-    # Regular text: add to replay, train a small pulse, then show generation
-    replay.add(user)
-    t0 = time.time()
-    avg_loss = training_pulse(train_steps_per_pulse)
-    dt = (time.time()-t0)*1000
-    print(f"⚙️  Trained {train_steps_per_pulse} steps | avg loss {avg_loss:.3f} | {dt:.0f} ms")
-
-    print("\n🧪 Sampling after update...")
-    sample = generate_sample(prefix="", max_new_tokens=300)
-    print(f"\n--- Generation (temp={temperature}) ---\n{sample}\n--- end ---")
+    # Regular text: process like normal user input
+    process_text_line(user, show_generation=True)
 

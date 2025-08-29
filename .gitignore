@@ -159,3 +159,7 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 training_data/training_data.bin
+model_checkpoint.pt
+dynamic_vocab.json
+test_pad_intensive.py
+test_pad_issue.py
