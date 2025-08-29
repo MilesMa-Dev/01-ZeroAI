@@ -200,17 +200,17 @@ class DynamicSPTokenizer:
     # -----------------------------
     def _should_expand_vocab(self) -> bool:
         """
-        Expand every 5, 10, 15, ... texts; cap at 8192.
+        Expand every 5, 10, 15, ... texts; cap at 16384.
         """
         seen = self.stats["total_texts_seen"]
         next_point = 5 * (len(self.stats["expansion_history"]) + 1)
-        if seen >= next_point and self.current_vocab_size < 8192:
+        if seen >= next_point and self.current_vocab_size < 16384:
             return True
         return False
 
     def _expand_vocabulary(self) -> None:
         old = self.current_vocab_size
-        self.current_vocab_size = min(8192, max(old + 1, int(old * 1.2)))  # +20% (at least +1)
+        self.current_vocab_size = min(16384, max(old + 1, int(old * 1.2)))  # +20% (at least +1)
         self.stats["expansion_history"].append({
             "from_size": old,
             "to_size": self.current_vocab_size,

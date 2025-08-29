@@ -405,9 +405,9 @@ while True:
     if user.startswith("/gen"):
         # /gen optional_prefix
         prefix = user[4:].lstrip()
-        print("\n🧪 Sampling...")
+        # print("\n🧪 Sampling...")
         txt = generate_sample(prefix=prefix, max_new_tokens=500)
-        print(f"\n--- Generation (temp={temperature}) ---\n{txt}\n--- end ---")
+        print(f"\n--- 🤖 Generation (temp={temperature}) ---\n{txt}\n--- end ---")
         continue
 
     if user.startswith("/save"):

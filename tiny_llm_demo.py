@@ -289,7 +289,7 @@ class TinyGPT(nn.Module):
                 
                 # Stop at natural sentence endings
                 if current_text and current_text[-1] in stop_chars:
-                    print(f"🛑 Natural stop at sentence ending (length: {generated_length})")
+                    # print(f"🛑 Natural stop at sentence ending (length: {generated_length})")
                     break
                 
                 # Stop if we see repetitive patterns
@@ -822,14 +822,14 @@ def process_text_line(text: str, show_generation=True):
     t0 = time.time()
     avg_loss = training_pulse(train_steps_per_pulse)
     dt = (time.time()-t0)*1000
-    print(f"⚙️  Trained {train_steps_per_pulse} steps | avg loss {avg_loss:.3f} | {dt:.0f} ms")
+    # print(f"⚙️  Trained {train_steps_per_pulse} steps | avg loss {avg_loss:.3f} | {dt:.0f} ms")
 
     # Generate sample if requested
     if show_generation:
         try:
             # print("\n🧪 Sampling after update...")
             sample = generate_sample(prefix="", max_new_tokens=100, adaptive_length=True)
-            print(f"\n--- Generation (temp={temperature}) ---\n{sample}\n--- end ---")
+            print(f"\n--- 🤖 Generation ---\n{sample}\n--- 🤖 end ---")
         except Exception as e:
             print(f"⚠️  Generation failed: {e}")
             print("   Training completed successfully, but generation had issues.")
@@ -964,12 +964,12 @@ while True:
     if user.startswith("/gen"):
         # /gen optional_prefix
         prefix = user[4:].lstrip()
-        print("\n🧪 Sampling...")
+        # print("\n🧪 Sampling...")
         # Use adaptive length for better natural responses
         adaptive = len(prefix.strip()) > 0  # Use adaptive for prefixed generation
         max_tokens = 300 if adaptive else 500  # Shorter max when adaptive
         txt = generate_sample(prefix=prefix, max_new_tokens=max_tokens, adaptive_length=adaptive)
-        print(f"\n--- Generation (temp={temperature}) ---\n{txt}\n--- end ---")
+        print(f"\n--- 🤖 Generation ---\n{txt}\n--- 🤖 end ---")
         continue
 
     if user.startswith("/save"):
