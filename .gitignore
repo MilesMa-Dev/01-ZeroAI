@@ -163,3 +163,9 @@ model_checkpoint.pt
 dynamic_vocab.json
 test_pad_intensive.py
 test_pad_issue.py
+tokenizer.model
+tokenizer.vocab
+sp_training_data.txt
+sp_stats.json
+temp_training.txt
+tokenizer.model

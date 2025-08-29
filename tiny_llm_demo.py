@@ -9,12 +9,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import json
 from typing import Optional, Tuple
+from sp_tokenizer import DynamicSPTokenizer
 
 # ------------------------------
 # Config (enhanced with modern features)
 # ------------------------------
-initial_vocab_size = 0       # Dynamic vocabulary starts from 0
-block_size   = 256          # context length
+initial_vocab_size = 500     # Dynamic SentencePiece starting vocab size
+block_size   = 256         # context length (supports up to 2048 with NTK scaling)
 n_embd       = 256           # model width
 n_head       = 8             # attention heads
 n_layer      = 4             # transformer layers
@@ -27,157 +28,57 @@ tie_weights  = True          # Weight tying between embedding and output
 use_ema      = True          # Exponential Moving Average
 ema_decay    = 0.999         # EMA decay rate
 top_p        = 0.9           # nucleus sampling
+max_context  = 2048          # Maximum supported context length with NTK scaling
 
 seed = 1337
 torch.manual_seed(seed)
 random.seed(seed)
 
-# ------------------------------
-# Dynamic Vocabulary Tokenizer
-# ------------------------------
-class DynamicTokenizer:
-    def __init__(self, vocab_file: str = "dynamic_vocab.json"):
-        self.vocab_file = vocab_file
-        self.char_to_id = {}  # Character to ID mapping
-        self.id_to_char = {}  # ID to character mapping
-        self.next_id = 0
-        
-        # Reserved tokens
-        self.pad_id = 0
-        self.unk_id = 1
-        
-        # Initialize with reserved tokens
-        self._add_token('<PAD>', self.pad_id)
-        self._add_token('<UNK>', self.unk_id)
-        self.next_id = 2
-        
-        # Load existing vocabulary if available
-        self._load_vocab()
-    
-    def _add_token(self, token: str, token_id: int = None):
-        """Add a token to the vocabulary"""
-        if token_id is None:
-            token_id = self.next_id
-            self.next_id += 1
-        
-        if token not in self.char_to_id:
-            self.char_to_id[token] = token_id
-            self.id_to_char[token_id] = token
-            
-            # Ensure next_id is always higher than existing IDs
-            if token_id >= self.next_id:
-                self.next_id = token_id + 1
-        
-        return token_id
-    
-    def _load_vocab(self):
-        """Load vocabulary from file if it exists"""
-        if os.path.exists(self.vocab_file):
-            try:
-                with open(self.vocab_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                
-                self.char_to_id = data.get('char_to_id', {})
-                self.id_to_char = {int(k): v for k, v in data.get('id_to_char', {}).items()}
-                self.next_id = data.get('next_id', 2)
-                
-                print(f"📄 Loaded dynamic vocabulary from {self.vocab_file} (vocab_size: {len(self.char_to_id)})")
-            except Exception as e:
-                print(f"⚠️ Could not load vocabulary file: {e}. Starting with empty vocabulary.")
-        else:
-            print("🔧 Starting with empty dynamic vocabulary")
-    
-    def _save_vocab(self):
-        """Save vocabulary to file"""
-        try:
-            data = {
-                'char_to_id': self.char_to_id,
-                'id_to_char': {str(k): v for k, v in self.id_to_char.items()},
-                'next_id': self.next_id
-            }
-            
-            with open(self.vocab_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"⚠️ Could not save vocabulary: {e}")
-    
-    def add_text(self, text: str):
-        """Add new characters from text to vocabulary"""
-        new_chars = []
-        for char in text:
-            if char not in self.char_to_id:
-                self._add_token(char)
-                new_chars.append(char)
-        
-        if new_chars:
-            print(f"📝 Added {len(new_chars)} new characters to vocabulary (total: {len(self.char_to_id)})")
-            self._save_vocab()
-    
-    
-    def encode(self, text: str) -> torch.Tensor:
-        """Encode text to token IDs"""
-        ids = []
-        for char in text:
-            if char in self.char_to_id:
-                ids.append(self.char_to_id[char])
-            else:
-                ids.append(self.unk_id)  # Unknown token
-        
-        return torch.tensor(ids, dtype=torch.long)
-    
-    def decode(self, ids: torch.Tensor) -> str:
-        """Decode token IDs to text, filtering out special tokens"""
-        if isinstance(ids, torch.Tensor):
-            ids = ids.tolist()
-        
-        chars = []
-        for token_id in ids:
-            if token_id in self.id_to_char:
-                char = self.id_to_char[token_id]
-                # Filter out special tokens (PAD, UNK)
-                if char not in ['<PAD>', '<UNK>']:
-                    chars.append(char)
-                # Skip special tokens silently
-            # If token_id not in vocabulary, skip it silently too
-        
-        return ''.join(chars)
-    
-    @property
-    def vocab_size(self) -> int:
-        """Current vocabulary size"""
-        return len(self.char_to_id)
-    
-    def get_stats(self):
-        """Get vocabulary statistics"""
-        return {
-            'vocab_size': self.vocab_size,
-            'total_characters': len([c for c in self.char_to_id.keys() if len(c) == 1 and c not in ['<PAD>', '<UNK>']]),
-            'special_tokens': len([c for c in self.char_to_id.keys() if c.startswith('<')]),
-            'vocab_file': self.vocab_file
-        }
-
-# Global tokenizer instance
-tokenizer = DynamicTokenizer()
+# Global tokenizer instance - Dynamic SentencePiece starting with 500 vocab
+tokenizer = DynamicSPTokenizer(base_vocab_size=500)
 
 # ------------------------------
 # Rotary Position Embedding (RoPE)
 # ------------------------------
 class RoPEEmbedding(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int = 2048):
+    def __init__(self, dim: int, max_seq_len: int = 2048, base_freq: float = 10000.0, ntk_scaling: bool = True):
         super().__init__()
         self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base_freq = base_freq
+        self.ntk_scaling = ntk_scaling
         
-        # Precompute frequencies
-        freqs = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        pos = torch.arange(max_seq_len).float()
-        freqs_grid = torch.outer(pos, freqs)  # (max_seq_len, dim//2)
+        # Build initial RoPE cache
+        self._build_rope_cache(max_seq_len)
+    
+    def _build_rope_cache(self, seq_len: int):
+        """Build RoPE cache with optional NTK scaling"""
+        # NTK scaling: adjust base frequency based on sequence length extension
+        if self.ntk_scaling and seq_len > self.max_seq_len:
+            # Calculate scaling factor for NTK
+            scale_factor = seq_len / self.max_seq_len
+            # Apply NTK scaling to base frequency
+            effective_base_freq = self.base_freq * (scale_factor ** (self.dim / (self.dim - 2)))
+            print(f"🔧 NTK scaling: seq_len={seq_len}, scale_factor={scale_factor:.2f}, effective_base_freq={effective_base_freq:.0f}")
+        else:
+            effective_base_freq = self.base_freq
         
-        self.register_buffer('freqs_cos', torch.cos(freqs_grid))
-        self.register_buffer('freqs_sin', torch.sin(freqs_grid))
+        # Precompute frequencies with potentially scaled base
+        freqs = 1.0 / (effective_base_freq ** (torch.arange(0, self.dim, 2).float() / self.dim))
+        pos = torch.arange(seq_len).float()
+        freqs_grid = torch.outer(pos, freqs)  # (seq_len, dim//2)
+        
+        self.register_buffer('freqs_cos', torch.cos(freqs_grid), persistent=False)
+        self.register_buffer('freqs_sin', torch.sin(freqs_grid), persistent=False)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: (batch, n_heads, seq_len, head_dim)
         seq_len = x.size(2)
+        
+        # Check if we need to rebuild cache for longer sequences
+        if seq_len > self.freqs_cos.size(0):
+            print(f"🔧 Extending RoPE cache from {self.freqs_cos.size(0)} to {seq_len}")
+            self._build_rope_cache(seq_len)
         
         # Get frequency components for current sequence length
         cos = self.freqs_cos[:seq_len]  # (seq_len, dim//2)
@@ -219,14 +120,15 @@ class CausalSelfAttention(nn.Module):
         self.attn_drop = nn.Dropout(dropout)
         self.resid_drop = nn.Dropout(dropout)
         
-        # RoPE embedding
+        # RoPE embedding with extended support and NTK scaling
         if use_rope:
-            self.rope = RoPEEmbedding(self.head_dim, block_size)
+            self.rope = RoPEEmbedding(self.head_dim, max_seq_len=2048, ntk_scaling=True)
         else:
             self.rope = None
             
-        # causal mask
-        mask = torch.tril(torch.ones(block_size, block_size)).view(1,1,block_size,block_size)
+        # causal mask - make it larger to support extended contexts
+        max_mask_size = 2048  # Support up to 2048 context length
+        mask = torch.tril(torch.ones(max_mask_size, max_mask_size)).view(1, 1, max_mask_size, max_mask_size)
         self.register_buffer("mask", mask)
 
     def forward(self, x):
@@ -277,7 +179,7 @@ class TinyGPT(nn.Module):
         super().__init__()
         self.block_size = block_size
         self.initial_vocab_size = vocab_size
-        self.tok_emb = nn.Embedding(max(vocab_size, 10), n_embd)  # Start with at least 10 embeddings
+        self.tok_emb = nn.Embedding(max(vocab_size, 10), n_embd)  # Dynamic vocab expansion
         
         # Only use positional embedding if not using RoPE
         if not use_rope:
@@ -336,7 +238,7 @@ class TinyGPT(nn.Module):
             if tie_weights:
                 self.head.weight = self.tok_emb.weight
         
-        print(f"🔄 Expanded vocabulary from {old_emb_size} to {new_vocab_size}")
+        print(f"🔄 Expanded model vocabulary from {old_emb_size} to {new_vocab_size}")
     
     @property
     def current_vocab_size(self):
@@ -906,7 +808,7 @@ def training_pulse(steps=50):
 
 def process_text_line(text: str, show_generation=True):
     """Process a single line of text just like normal user input"""
-    # First, add new characters to tokenizer vocabulary
+    # Add new text to dynamic SentencePiece tokenizer
     tokenizer.add_text(text)
     
     # Expand model vocabulary if needed
@@ -965,7 +867,7 @@ def generate_sample(prefix: str = "", max_new_tokens=200, adaptive_length=True):
 # ------------------------------
 # REPL
 # ------------------------------
-help_tip = "Enhanced TinyGPT with Dynamic Vocabulary, RoPE, weight sharing, cosine LR, EMA, and top-p sampling\nCommands: /gen [prefix], /temp=1.2, /topp=0.9, /steps=200, /load_txt [txt_file], /train [txt_file], /save [filename], /load [filename], /stats, /reset, /quit"
+help_tip = "Enhanced TinyGPT with Dynamic Vocabulary, RoPE+NTK, weight sharing, cosine LR, EMA, and top-p sampling\nCommands: /gen [prefix], /temp=1.2, /topp=0.9, /steps=200, /context=1024, /load_txt [txt_file], /train [txt_file], /save [filename], /load [filename], /stats, /reset, /quit\nNTK Scaling: Supports context lengths up to 2048 tokens"
 print(help_tip)
 
 while True:
@@ -993,7 +895,17 @@ while True:
                     import shutil
                     shutil.rmtree("training_data")
                 
-                print("🔄 Model reset complete. Please restart the program for changes to take effect.")
+                # Remove SentencePiece files
+                if os.path.exists("tokenizer.model"):
+                    os.remove("tokenizer.model")
+                if os.path.exists("tokenizer.vocab"):
+                    os.remove("tokenizer.vocab")
+                if os.path.exists("sp_training_data.txt"):
+                    os.remove("sp_training_data.txt")
+                if os.path.exists("sp_stats.json"):
+                    os.remove("sp_stats.json")
+                
+                print("🔄 Model and tokenizer reset complete. Please restart the program for changes to take effect.")
                 break
             except Exception as e:
                 print(f"❌ Reset failed: {e}")
@@ -1029,6 +941,24 @@ while True:
             print(f"Set train_steps_per_pulse = {train_steps_per_pulse}")
         except:
             print("Usage: /steps=100")
+        continue
+
+    if user.startswith("/context="):
+        try:
+            new_block_size = int(user.split("=",1)[1])
+            if new_block_size < 64:
+                print("❌ Context size must be at least 64")
+                continue
+            if new_block_size > max_context:
+                print(f"❌ Context size cannot exceed {max_context} (NTK scaling limit)")
+                continue
+            
+            # Update global block_size
+            globals()['block_size'] = new_block_size
+            print(f"✅ Set context length = {new_block_size}")
+            print("🔧 NTK scaling will automatically handle sequences longer than the original training length")
+        except:
+            print(f"Usage: /context=1024 (max: {max_context})")
         continue
 
     if user.startswith("/gen"):
@@ -1148,7 +1078,8 @@ while True:
         print(f"📊 Enhanced TinyGPT Statistics:")
         print(f"   Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
         print(f"   Vocab size: {tokenizer.vocab_size} (Dynamic)")
-        print(f"   RoPE: {'✅' if use_rope else '❌'}")
+        print(f"   Context length: {block_size} (max: {max_context} with NTK)")
+        print(f"   RoPE+NTK: {'✅' if use_rope else '❌'}")
         print(f"   Weight sharing: {'✅' if tie_weights else '❌'}")
         print(f"   EMA: {'✅' if use_ema else '❌'}")
         print(f"   Current LR: {scheduler.optimizer.param_groups[0]['lr']:.2e}")
