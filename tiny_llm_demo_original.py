@@ -466,7 +466,7 @@ while True:
                 print(f"⚙️  Trained {train_steps_per_pulse} steps | avg loss {avg_loss:.3f} | {dt:.0f} ms")
                 
                 # Generate sample after each line training (like manual input)
-                print("🧪 Sampling after update...")
+                # print("🧪 Sampling after update...")
                 sample = generate_sample(prefix="", max_new_tokens=300)
                 print(f"\n--- Generation (temp={temperature}) ---\n{sample}\n--- end ---")
             
@@ -492,7 +492,7 @@ while True:
     dt = (time.time()-t0)*1000
     print(f"⚙️  Trained {train_steps_per_pulse} steps | avg loss {avg_loss:.3f} | {dt:.0f} ms")
 
-    print("\n🧪 Sampling after update...")
+    # print("\n🧪 Sampling after update...")
     sample = generate_sample(prefix="", max_new_tokens=300)
     print(f"\n--- Generation (temp={temperature}) ---\n{sample}\n--- end ---")
 

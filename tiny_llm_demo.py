@@ -238,7 +238,7 @@ class TinyGPT(nn.Module):
             if tie_weights:
                 self.head.weight = self.tok_emb.weight
         
-        print(f"🔄 Expanded model vocabulary from {old_emb_size} to {new_vocab_size}")
+        # print(f"🔄 Expanded model vocabulary from {old_emb_size} to {new_vocab_size}")
     
     @property
     def current_vocab_size(self):
@@ -827,7 +827,7 @@ def process_text_line(text: str, show_generation=True):
     # Generate sample if requested
     if show_generation:
         try:
-            print("\n🧪 Sampling after update...")
+            # print("\n🧪 Sampling after update...")
             sample = generate_sample(prefix="", max_new_tokens=100, adaptive_length=True)
             print(f"\n--- Generation (temp={temperature}) ---\n{sample}\n--- end ---")
         except Exception as e:
@@ -1006,7 +1006,7 @@ while True:
             for i, line in enumerate(lines, 1):
                 line = line.strip()
                 if not line:  # Skip empty lines
-                    print(f"⏭️  Skipping empty line {i}/{total_lines}")
+                    # print(f"⏭️  Skipping empty line {i}/{total_lines}")
                     continue
                 
                 print(f"\n📝 Processing line {i}/{total_lines}: {line}")
@@ -1059,7 +1059,7 @@ while True:
             for i, line in enumerate(lines, 1):
                 line = line.strip()
                 if not line:  # Skip empty lines
-                    print(f"⏭️  Skipping empty line {i}/{total_lines}")
+                    # print(f"⏭️  Skipping empty line {i}/{total_lines}")
                     continue
                 
                 print(f"\n📝 Training on line {i}/{total_lines}: {line}")
@@ -1089,9 +1089,11 @@ while True:
         # Add vocabulary statistics
         vocab_stats = tokenizer.get_stats()
         print(f"🔤 Vocabulary:")
-        print(f"   Characters: {vocab_stats['total_characters']}")
-        print(f"   Special tokens: {vocab_stats['special_tokens']}")
-        print(f"   Vocab file: {vocab_stats['vocab_file']}")
+        print(f"   Vocab size: {vocab_stats['vocab_size']}")
+        print(f"   Model type: {vocab_stats['model_type']}")
+        print(f"   Model loaded: {vocab_stats['model_loaded']}")
+        print(f"   Model path: {vocab_stats['model_path']}")
+        print(f"   Total texts seen: {vocab_stats['total_texts_seen']}")
         print(f"📚 Training Data:")
         print(f"   Total data stored: {stats['total_size_mb']:.1f} MB")
         print(f"   Memory cache: {stats['cache_size_kb']:.1f} KB")
