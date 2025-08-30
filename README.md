@@ -35,9 +35,12 @@
 
 ## 🚀 快速开始
 
+### 安装带cuda的pytorch
+https://pytorch.org/get-started/locally/
+
 ### 安装依赖
 ```bash
-pip install torch>=2.0.0
+pip install -r requirements.txt
 ```
 
 ### 运行程序
@@ -56,7 +59,7 @@ python tiny_llm_demo.py
 
 2. **文件训练**: 批量处理txt文件
    ```
-   /load_txt xiyou.txt
+   /load_txt txt/xiyou.txt
    ```
 
 3. **生成文本**: 使用训练后的模型生成
@@ -69,7 +72,7 @@ python tiny_llm_demo.py
 | 命令 | 功能 | 示例 |
 |------|------|------|
 | `文本输入` | 训练模型并扩展词汇表 | `你好世界` |
-| `/load_txt [file]` | 逐行加载训练文件 | `/load_txt data.txt` |
+| `/load_txt [file]` | 逐行加载训练文件 | `/load_txt txt/xiyou.txt` |
 | `/gen [prefix]` | 生成文本（智能长度控制） | `/gen 西遊記` |
 | `/temp=X.X` | 设置采样温度（0.1-5.0） | `/temp=1.2` |
 | `/topp=X.X` | 设置top-p参数 | `/topp=0.9` |
@@ -79,32 +82,6 @@ python tiny_llm_demo.py
 | `/load [file]` | 加载模型 | `/load my_model.pt` |
 | `/reset` | 重置模型到初始状态 | `/reset` |
 | `/quit` | 退出程序 | `/quit` |
-
-## 🎯 使用场景
-
-### 1. 语言学习实验
-```bash
-# 从空模型开始学习中文
-python tiny_llm_demo.py
-> 你好
-> 世界
-> /gen 你
-```
-
-### 2. 古文训练
-```bash
-# 训练古典文学
-> /load_txt xiyou.txt
-# 观察词汇表如何从英文扩展到中文
-> /stats
-```
-
-### 3. 多语言支持
-模型自动适应任何语言：
-- 🇨🇳 中文：自动学习汉字
-- 🇺🇸 英文：学习字母和标点
-- 🇯🇵 日文：支持假名和汉字
-- 🌍 任意Unicode字符
 
 ## 📊 统计信息示例
 
